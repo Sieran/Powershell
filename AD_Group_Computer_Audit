@@ -1,0 +1,186 @@
+# globals
+$g_group = ''
+$g_parent = ''
+
+$primarydomain = 'domain1'
+$secondarydomain = 'domain2'
+$secondarydomainfqdn = 'domain2.microsoft.com'
+$basePath = "C:\Temp"
+$outputFileLog = "$basePath\User-audit.txt"
+$dateStamp1 = get-date -uformat "%Y%m%d"
+$dateStamp2 = get-date -uformat "%H%m%S"
+$outputFileLog = "$basePath\User-audit-$dateStamp1-$dateStamp2.txt"
+
+# gets members of local admins
+function get-localadmins{
+    [cmdletbinding()]
+    Param(
+    [string]$computerName,
+	[string]$groupName
+    )
+    # using wmi
+    #$group = get-wmiobject win32_group -ComputerName $computerName -Filter "LocalAccount=True AND SID='S-1-5-32-544'"
+    #$query = "GroupComponent = `"Win32_Group.Domain='$($group.domain)'`,Name='$($group.name)'`""
+    #$list = Get-WmiObject win32_groupuser -ComputerName $computerName -Filter $query
+    #$list = $list.PartComponent | % {$_.substring($_.lastindexof("Domain=") + 7).replace("`",Name=`"","\")}
+
+    # using asdi
+    $list = @()
+    $Computer = [ADSI]"WinNT://$computerName"
+    $Group = $computer.psbase.children.find("$groupName")
+    $Members = @($Group.psbase.Invoke("Members"))
+    ForEach ($Member In $Members)
+    {
+        $item = $Member.GetType().InvokeMember("Adspath", 'GetProperty', $Null, $Member, $Null)
+        $item = $item -replace "WinNT://", ""
+        $list += $item
+    }
+    
+    
+    # build array of group/user objects
+    $array = @()
+    foreach($member in $list)
+    {
+        # remove quotes
+        $member = $member.Replace('"', '')
+        $member_parts = $member.Split('/')
+        
+        # get member object
+        #if ($member -contains 'domain1\Windows Admins') {
+        $array += get-member-item $member_parts[1] $member_parts[0].ToLower()
+        #}
+
+    }
+    $array
+}
+
+# get member object based on domain
+function get-member-item($member, $domain)
+{ 
+    $Item = $null
+
+    if ($domain -ccontains $secondarydomain) 
+    {
+        Try
+        {
+            $Item = Get-ADGroup $member -Server $secondarydomainfqdn
+        } 
+        Catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] 
+        {
+            $Item = Get-ADUser $member -Server $secondarydomainfqdn
+        } 
+        Catch 
+        {
+            Write-Warning "************ FAILED ************"
+            Write-Warning '$domain:   ' $domain
+            Write-Warning '$member:   ' $member
+            Write-Warning '$g_group:  ' $g_group
+            Write-Warning '$g_parent: ' $g_parent
+        }
+    }
+    elseif ($domain -ccontains $primarydomain) 
+    {
+        Try 
+        {
+            $Item = Get-ADGroup $member
+        } 
+        Catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] 
+        {
+            $Item = Get-ADUser $member
+        } 
+        Catch 
+        {
+            Write-Warning "************ FAILED ************"
+            Write-Warning '$domain:   ' $domain
+            Write-Warning '$member:   ' $member
+            Write-Warning '$g_group:  ' $g_group
+            Write-Warning '$g_parent: ' $g_parent
+        }
+    }
+    return $Item
+}
+
+function get-domain($identity)
+{
+    # parse to get domain from dn
+    $long_name = ((($identity -replace "(.*?)DC=(.*)",'$2') -replace "DC=","") -replace ",",".")
+    $long_name.Split('.')[0]
+}
+
+function list-members($members, $parent = '', $server = '')
+{
+    foreach($member in $members)
+    {
+        if ($member -ne $null) 
+        {
+            # get domain / members
+            $domain = (get-domain $member.DistinguishedName)
+            $membername = $member.SamAccountName           
+
+            if ($member.ObjectClass -eq 'group')
+            {
+                # get group name
+                $g_group = $domain + "\" + $membername
+
+                # set parent
+                If ($parent -ne '') 
+                {
+                    $g_parent = $parent 
+                }
+
+                # if domain1 run normal, if domain2, pass in ad server
+                if ($domain -match $primarydomain) 
+                {
+                    $list = Get-ADGroupMember $membername | Sort-Object -Descending -property 'objectClass'
+                    list-members $list ("${domain}\${membername}") $server
+                } 
+                elseif ($domain -match $secondarydomain) 
+                {
+                    $list = Get-ADGroupMember $membername -Server $secondarydomainfqdn | Sort-Object -Descending -property 'objectClass'
+                    list-members $list ("${domain}\${membername}") $server
+                }
+
+                # if the list count is empty, we'll write that to the output
+                if ($list.count -eq 0) 
+                {
+                    #Write-Host "${server},${domain}\${membername},group(empty),${g_parent},"
+					"$dateStamp1,$dateStamp2,${server},${domain}\${membername},group(empty),${g_parent}" | add-content $outputFileLog
+                }
+                # reset group
+                $g_group = ''
+            } 
+            else 
+            {
+                if ($g_group -eq '') 
+                {
+                    #$g_group = "${server}\Administrators"
+					$g_group = "${server}\$group"
+                }
+                #Write-Host "${server},${domain}\${membername},user,${g_group},${g_parent}"
+				"$dateStamp1,$dateStamp2,${server},${domain}\${membername},user,${g_group},${g_parent}" | add-content $outputFileLog
+            }
+        }
+    }
+}
+
+function list-remote-admins($server, $group)
+{
+    $members = get-localadmins $server $group
+    list-members $members '' $server
+}
+
+"YearMonthDay,HourMinuteSecond,Location,User,Group" | add-content $outputFileLog
+
+#The 'list-remote-admins' command can be run against a specific group on a target computer or directly
+#against a group in Active Directory.Specify the full domain name or the FQDN of the computer followed
+#by the group you wish to audit.
+#
+#Example: 
+#
+#list-remote-admins 'computername.consoto.microsoft.com' 'Administrators'
+#
+#or
+#
+#list-remote-admins 'consoto.microsoft.com' 'Domain Admins'
+
+list-remote-admins 'computer_name' 'Administrators'
